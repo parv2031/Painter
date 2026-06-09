@@ -70,10 +70,15 @@ where αᵢ is the cumulative angle sum up to joint i.
 
 ### Workspace
 
-| Property | Value (default arm) |
-|----------|---------------------|
-| Max reach | L₁+L₂+L₃ = **7.0** units |
-| Min reach | \|L₁−L₂−L₃\| = **0.5** units |
+| Property | Formula | Value (default arm) |
+|----------|---------|---------------------|
+| Max reach | L₁ + L₂ + L₃ | **7.0** units |
+| Min reach | max(0, L₁ − L₂ − L₃) | **0** — no dead zone |
+
+**Why min reach = 0:**  
+The condition `L₂ + L₃ ≥ L₁` (4.0 ≥ 3.0) means links 2 and 3 together are long enough to fold back and cancel link 1's extension entirely. The arm can reach all the way to its own base, so the workspace is a **full disc** of radius 7.0, not an annulus.
+
+> **Note:** The formula `|L₁ − L₂ − L₃|` for minimum reach is only correct for a **2-link arm**. For a 3-link arm with unlimited joint rotation, the correct formula is `max(0, L₁ − L₂ − L₃)`.
 
 ---
 
