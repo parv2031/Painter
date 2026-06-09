@@ -123,6 +123,130 @@ def ik_analytical(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Analytical IK with automatic φ selection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ik_analytical_auto(
+    arm: ThreeLinkArm,
+    x: float,
+    y: float,
+    elbow_up: bool = True,
+) -> dict:
+    """
+    Closed-form IK that automatically finds a valid end-effector orientation
+    φ so that ANY point within the workspace disc (radius ≤ L1+L2+L3) can
+    be reached — no user-supplied φ needed.
+
+    Mathematical basis
+    ------------------
+    For a given target (x, y) at distance r = √(x²+y²) and angle α = atan2(y,x),
+    the wrist position after subtracting link-3 is:
+
+        wx = x − L3·cos(φ),   wy = y − L3·sin(φ)
+
+    The squared wrist-to-base distance is:
+
+        d_w² = r² + L3² − 2·L3·r·cos(φ − α)          ... (★)
+
+    For the 2-link sub-arm (L1, L2) to reach the wrist, we need:
+
+        d_min² ≤ d_w² ≤ d_max²
+        where  d_min = |L1−L2|,  d_max = L1+L2
+
+    Rearranging (★) gives the required range of cos(φ − α):
+
+        c_lo = (r² + L3² − d_max²) / (2·L3·r)
+        c_hi = (r² + L3² − d_min²) / (2·L3·r)
+
+    We pick the midpoint c* = (c_lo + c_hi) / 2  which places the wrist at
+    the best-conditioned distance, then:
+
+        φ = α ± arccos(c*)
+
+    Both signs are tried; the first that produces a valid solution is returned.
+
+    Strategy (in order of preference)
+    ----------------------------------
+    1. Natural orientation:  φ = α  (arm points radially outward — smooth,
+       works for most of the workspace where |r − L3| ∈ [d_min, d_max]).
+    2. Computed optimal φ from the midpoint of the valid cosine range.
+    3. Fallback scan over 36 uniformly spaced φ ∈ [0, 2π).
+
+    Parameters
+    ----------
+    arm      : ThreeLinkArm instance.
+    x, y     : Target end-effector position.
+    elbow_up : Elbow-up (True) or elbow-down (False).
+
+    Returns
+    -------
+    dict with keys: success, angles, position_error, phi_chosen, note.
+    """
+    L1, L2, L3 = arm.link_lengths
+    r     = np.hypot(x, y)
+    alpha = np.arctan2(y, x)
+
+    d_min = abs(L1 - L2)      # min reachable wrist distance  = 0.5
+    d_max = L1 + L2            # max reachable wrist distance  = 5.5
+
+    # ── Global reachability ───────────────────────────────────────────────
+    if r > L1 + L2 + L3 + 1e-9:
+        return _ik_result(False, [0, 0, 0], note="Target out of reach (too far)")
+
+    def _try(phi_candidate):
+        res = ik_analytical(arm, x, y, phi_candidate, elbow_up=elbow_up)
+        if res["success"]:
+            res["phi_chosen"] = phi_candidate
+        return res
+
+    # ── Strategy 1: natural (radial) orientation ──────────────────────────
+    # φ = α  →  d_w = |r − L3|
+    res = _try(alpha)
+    if res["success"]:
+        res["note"] = f"auto-φ natural α={np.degrees(alpha):.1f}°"
+        return res
+
+    # ── Strategy 2: analytically compute the optimal φ ───────────────────
+    # Valid cosine range for (φ − α):
+    if r < 1e-9:
+        # At origin: any φ with d_w = L3 works if L3 ∈ [d_min, d_max]
+        phi_candidates = [0.0, np.pi / 2, np.pi, 3 * np.pi / 2]
+    else:
+        c_lo = (r**2 + L3**2 - d_max**2) / (2 * L3 * r)
+        c_hi = (r**2 + L3**2 - d_min**2) / (2 * L3 * r)
+        c_lo = np.clip(c_lo, -1.0, 1.0)
+        c_hi = np.clip(c_hi, -1.0, 1.0)
+
+        if c_lo > c_hi + 1e-9:
+            return _ik_result(False, [0, 0, 0], note="No valid φ exists for this target")
+
+        # Midpoint of valid cosine range → best-conditioned wrist distance
+        c_mid  = (c_lo + c_hi) / 2.0
+        delta  = np.arccos(np.clip(c_mid, -1.0, 1.0))
+        phi_candidates = [
+            alpha + delta,
+            alpha - delta,
+            alpha + np.pi,      # point link3 toward base
+            alpha - np.pi,
+        ]
+
+    for phi_cand in phi_candidates:
+        res = _try(phi_cand)
+        if res["success"]:
+            res["note"] = f"auto-φ computed={np.degrees(phi_cand):.1f}°"
+            return res
+
+    # ── Strategy 3: brute-force scan ─────────────────────────────────────
+    for phi_scan in np.linspace(0, 2 * np.pi, 72, endpoint=False):
+        res = _try(phi_scan)
+        if res["success"]:
+            res["note"] = f"auto-φ scan={np.degrees(phi_scan):.1f}°"
+            return res
+
+    return _ik_result(False, [0, 0, 0], note="No valid configuration found after full scan")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Jacobian Pseudo-inverse IK  (numerical, position-only)
 # ─────────────────────────────────────────────────────────────────────────────
 

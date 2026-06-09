@@ -17,7 +17,7 @@ import sys, os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "week1_forward_kinematics"))
 from forward_kinematics import ThreeLinkArm
-from inverse_kinematics import ik_analytical, ik_jacobian
+from inverse_kinematics import ik_analytical, ik_jacobian, ik_analytical_auto
 
 # ─── Palette ─────────────────────────────────────────────────────────────────
 BG      = "#0d0d1a"
@@ -121,8 +121,10 @@ def main():
     ax = fig.add_axes([0.08, 0.22, 0.72, 0.74])
 
     # Radio — solver choice
-    ax_radio = fig.add_axes([0.83, 0.60, 0.14, 0.18], facecolor="#0a0a18")
-    radio = RadioButtons(ax_radio, ("Analytical\nElbow-up",
+    ax_radio = fig.add_axes([0.83, 0.55, 0.14, 0.24], facecolor="#0a0a18")
+    radio = RadioButtons(ax_radio, ("Auto-φ\nElbow-up",
+                                    "Auto-φ\nElbow-dn",
+                                    "Analytical\nElbow-up",
                                     "Analytical\nElbow-dn",
                                     "Jacobian\nPseudo-inv"),
                          activecolor="#4fc3f7")
@@ -136,8 +138,8 @@ def main():
                     color="#2a4080", track_color="#1e1e3a")
     s_phi.label.set_color(TEXT); s_phi.valtext.set_color(TEXT)
     fig.text(0.15, 0.07,
-             "φ slider: only used by Analytical solvers. "
-             "Jacobian solver leaves orientation free.",
+             "φ slider: only used by 'Analytical' solvers. "
+             "Auto-φ and Jacobian choose orientation automatically.",
              color="#aaaaaa", fontsize=7.5)
 
     # Hint
@@ -151,7 +153,11 @@ def main():
         phi_rad = np.radians(s_phi.val)
         label   = radio.value_selected
 
-        if "Elbow-up" in label:
+        if "Auto-φ" in label and "Elbow-up" in label:
+            res = ik_analytical_auto(arm, *target, elbow_up=True)
+        elif "Auto-φ" in label and "Elbow-dn" in label:
+            res = ik_analytical_auto(arm, *target, elbow_up=False)
+        elif "Elbow-up" in label:
             res = ik_analytical(arm, *target, phi_rad, elbow_up=True)
         elif "Elbow-dn" in label:
             res = ik_analytical(arm, *target, phi_rad, elbow_up=False)

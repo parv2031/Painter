@@ -11,7 +11,7 @@ import sys, os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "week1_forward_kinematics"))
 from forward_kinematics import ThreeLinkArm
-from inverse_kinematics import ik_analytical, ik_jacobian
+from inverse_kinematics import ik_analytical, ik_jacobian, ik_analytical_auto
 
 ARM = ThreeLinkArm(link_lengths=(3.0, 2.5, 1.5))
 
@@ -122,3 +122,67 @@ class TestJacobianIK:
         res = ik_jacobian(ARM, 4.0, 3.0)
         for key in ("success", "angles", "iterations", "position_error", "note"):
             assert key in res
+
+
+# ─── Auto-φ IK ──────────────────────────────────────────────────────────────────────────────────
+
+class TestAutoIK:
+    """
+    ik_analytical_auto must succeed for ANY point within the workspace disc
+    (radius ≤ L1+L2+L3 = 7.0) regardless of orientation constraints.
+    """
+
+    def _check(self, x, y, tol=1e-5, elbow_up=True):
+        """Assert ik_analytical_auto reaches (x,y) to within tol."""
+        res = ik_analytical_auto(ARM, x, y, elbow_up=elbow_up)
+        assert res["success"], f"Failed for ({x}, {y}): {res['note']}"
+        ee = ARM.forward_kinematics(res["angles"])["end_effector"]
+        assert np.linalg.norm(ee - np.array([x, y])) < tol, \
+            f"EE error too large for ({x}, {y}): {np.linalg.norm(ee - [x, y]):.2e}"
+
+    # ── Full workspace sweep ────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("r,angle_deg", [
+        # Near-base (the problematic zone for fixed-φ solver)
+        (0.1,   0), (0.1,  90), (0.1, 180), (0.1, 270),
+        (0.5,  45), (0.5, 135), (0.5, 225), (0.5, 315),
+        (1.0,   0), (1.0,  60), (1.0, 120), (1.0, 180),
+        (1.2,  30), (1.2, 150), (1.2, 210), (1.2, 330),
+        (1.4,   0), (1.4,  90),
+        # Mid workspace
+        (2.0,   0), (2.0,  45), (2.0, 135), (2.0, 225),
+        (3.5,  60), (3.5, 150), (3.5, 270),
+        (5.0,   0), (5.0,  90), (5.0, 180), (5.0, 270),
+        # Near max reach
+        (6.5,  30), (6.5, 120), (6.5, 210), (6.5, 300),
+        (6.9,   0), (6.9,  90), (6.9, 180),
+    ])
+    def test_workspace_sweep(self, r, angle_deg):
+        """Arm must reach every sampled point inside the workspace."""
+        theta = np.radians(angle_deg)
+        x, y  = r * np.cos(theta), r * np.sin(theta)
+        self._check(x, y)
+
+    def test_origin(self):
+        """Reaching (0, 0) — the base itself."""
+        self._check(0.0, 0.0, tol=1e-4)
+
+    def test_all_quadrants(self):
+        for x, y in [(4, 3), (-4, 3), (-4, -3), (4, -3)]:
+            self._check(x, y)
+
+    def test_elbow_down_variant(self):
+        """Auto-φ should also work with elbow-down."""
+        self._check(5.0, 2.0, elbow_up=False)
+        self._check(1.2, 0.5, elbow_up=False)
+
+    def test_out_of_reach_fails(self):
+        res = ik_analytical_auto(ARM, 10.0, 0.0)
+        assert not res["success"]
+        res2 = ik_analytical_auto(ARM, 0.0, 8.0)
+        assert not res2["success"]
+
+    def test_result_has_phi_chosen_on_success(self):
+        res = ik_analytical_auto(ARM, 4.0, 3.0)
+        assert res["success"]
+        assert "phi_chosen" in res
