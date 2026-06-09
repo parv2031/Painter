@@ -1,4 +1,4 @@
-# Week 3-4 — Inverse Kinematics
+# Week 2 — Inverse Kinematics
 
 **Project:** Bob Ross without ROS — Robotics Society Summer Project  
 **Mentors:** Anjaneya and Parv  
