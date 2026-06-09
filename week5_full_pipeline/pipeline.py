@@ -25,7 +25,7 @@ from tkinter import filedialog
 from forward_kinematics import ThreeLinkArm
 from trajectory import plan_linear_trajectory
 from inverse_kinematics import ik_analytical_auto
-from image_processor import process_image, save_strokes
+from image_processor import process_image, save_strokes, space_points_wisely
 
 ARM        = ThreeLinkArm(link_lengths=(3.0, 2.5, 1.5))
 DRAW_SPEED = 6.0
@@ -236,7 +236,173 @@ def compute_frames(ordered_strokes):
             print(f"  [{bar}] {pct:5.1f}%", end="\r")
 
     print(f"\n  Done — {len(all_frames)} total frames")
+
+    # ── Return-to-home: pen-up move to a tidy rest position inside the box ──
+    home = np.array([_MARGIN + 0.3, _MARGIN + 0.3])
+    if all_frames:
+        home_frames = _seg_frames(all_frames[-1]["ee"], home, prev, False,
+                                  stroke_idx=len(ordered_strokes))
+        all_frames.extend(home_frames)
+        print(f"  + {len(home_frames)} return-to-home frames")
+
     return all_frames
+
+
+# ─── # ─── Interactive Preview Tuner ────────────────────────────────────────────────────
+
+def interactive_preview(img_path: str) -> tuple:
+    """
+    Opens a live-tuning window with 7 sliders.  The user adjusts parameters
+    until the sketch + waypoints look right, then clicks “Start Simulation”.
+
+    Sliders
+    -------
+    CLAHE clip   — local contrast enhancement (higher = more contrast)
+    Bilateral σ  — edge-preserving blur (higher = smoother / fewer fine edges)
+    Canny σ      — edge sensitivity (higher = more / finer edges)
+    Gamma        — brightness correction (<1 darker, >1 brighter)
+    Morph close  — gap-closing iterations (higher = fewer broken edges)
+    Min stroke % — shortest contour kept as % of image size
+    Spacing (px) — waypoint density along each stroke
+
+    Returns
+    -------
+    (strokes_px, edges, img_bgr, step_px) with the settings at “Start”.
+    """
+    img_bgr = cv2.imread(img_path)
+    if img_bgr is None:
+        raise FileNotFoundError(img_path)
+    H, W = img_bgr.shape[:2]
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    def_step = float(np.clip(min(H, W) * 0.015, 8.0, 30.0))
+
+    state = {"spaced": [], "edges": None, "step": def_step}
+
+    # ── Figure layout ───────────────────────────────────────────────────
+    fig = plt.figure(figsize=(17, 11))
+    fig.patch.set_facecolor("#0d0d1a")
+    fig.canvas.manager.set_window_title(
+        "Interactive Tuner — adjust sliders, then click Start Simulation")
+
+    ax_orig = fig.add_axes([0.01,  0.42, 0.30, 0.54])
+    ax_sk   = fig.add_axes([0.345, 0.42, 0.30, 0.54])
+    ax_wp   = fig.add_axes([0.68,  0.42, 0.30, 0.54])
+    for ax in (ax_orig, ax_sk, ax_wp):
+        ax.set_facecolor("#0a0a18")
+    ax_orig.imshow(img_rgb); ax_orig.axis("off")
+    ax_orig.set_title("Original Image", color="white", fontsize=10, pad=4)
+
+    # Slider positions: 2 columns, 4 rows
+    SH, SW = 0.022, 0.37
+    def _sl_ax(col, row):   # col 0=left, 1=right;  row 0..3 top..bottom
+        x = 0.05 + col * 0.50
+        y = 0.31 - row * 0.065
+        return fig.add_axes([x, y, SW, SH])
+
+    from matplotlib.widgets import Slider, Button
+    _sc = "#3d5a80"
+    def _sl(ax, lbl, lo, hi, init, step=None):
+        kw = {} if step is None else {"valstep": step}
+        s = Slider(ax, lbl, lo, hi, valinit=init, color=_sc, **kw)
+        s.label.set_color("white"); s.valtext.set_color("white")
+        s.label.set_fontsize(8);   s.valtext.set_fontsize(8)
+        return s
+
+    sl_clahe   = _sl(_sl_ax(0,0), "CLAHE clip",     0.5, 5.0,  2.0,  0.1)
+    sl_bil     = _sl(_sl_ax(1,0), "Bilateral σ",     10,  80,   40,   1)
+    sl_canny   = _sl(_sl_ax(0,1), "Canny σ",         0.1, 0.7,  0.33, 0.01)
+    sl_gamma   = _sl(_sl_ax(1,1), "Gamma",           0.3, 2.5,  1.0,  0.05)
+    sl_morph   = _sl(_sl_ax(0,2), "Morph close",     0,   4,    1,    1)
+    sl_minlen  = _sl(_sl_ax(1,2), "Min stroke %",    0.2, 3.0,  1.0,  0.1)
+    sl_spacing = _sl(_sl_ax(0,3), "Waypoint spacing", 4,  50,   def_step, 1)
+
+    ax_btn = fig.add_axes([0.60, 0.04, 0.32, 0.07])
+    btn_start = Button(ax_btn, "▶  Start Simulation",
+                       color="#1a4a2e", hovercolor="#2d7a4e")
+    btn_start.label.set_color("white"); btn_start.label.set_fontsize(10)
+
+    # ── Processing callback ─────────────────────────────────────────────────
+    def _reprocess(_=None):
+        clahe_clip  = float(sl_clahe.val)
+        bil_sigma   = int(sl_bil.val)
+        canny_sigma = float(sl_canny.val)
+        gamma       = float(sl_gamma.val)
+        morph_iter  = int(round(sl_morph.val))
+        min_pct     = float(sl_minlen.val) / 100.0
+        step        = float(sl_spacing.val)
+
+        # --- Preprocessing ---
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        if abs(gamma - 1.0) > 0.02:          # gamma correction
+            lut = np.array([(i/255.0)**(1.0/gamma)*255
+                            for i in range(256)], dtype=np.uint8)
+            gray = cv2.LUT(gray, lut)
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        blurred  = cv2.bilateralFilter(enhanced, d=7,
+                                       sigmaColor=bil_sigma, sigmaSpace=bil_sigma)
+
+        # --- Canny at normalised resolution ---
+        MAX_SIDE = 1200
+        h, w = blurred.shape
+        sc = min(1.0, MAX_SIDE / max(h, w))
+        small = cv2.resize(blurred, (int(w*sc), int(h*sc)), cv2.INTER_AREA) if sc < 1 else blurred
+        median = np.median(small)
+        lo = max(0,   int((1 - canny_sigma) * median))
+        hi = min(255, int((1 + canny_sigma) * median))
+        esmall = cv2.Canny(small, lo, hi)
+        if morph_iter > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            esmall = cv2.morphologyEx(esmall, cv2.MORPH_CLOSE, k, iterations=morph_iter)
+        edges = cv2.resize(esmall, (w, h), cv2.INTER_NEAREST) if sc < 1 else esmall
+
+        # --- Contours ---
+        raw, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        min_len = max(15.0, min(h, w) * min_pct)
+        contours = []
+        for cnt in raw:
+            if cv2.arcLength(cnt, closed=False) >= min_len:
+                pts = cnt.squeeze(axis=1)
+                contours.append(pts.reshape(1,2) if pts.ndim==1 else pts)
+        contours.sort(key=lambda c: -len(c))
+        spaced = [s for cnt in contours
+                  for s in [space_points_wisely(cnt, step)] if len(s) >= 2]
+
+        # --- Update panels ---
+        ax_sk.cla(); ax_sk.set_facecolor("#0a0a18")
+        ax_sk.imshow(edges, cmap="gray_r")
+        ax_sk.set_title(f"Sketch  |  {len(spaced)} strokes",
+                        color="white", fontsize=10, pad=4)
+        ax_sk.axis("off")
+
+        ax_wp.cla(); ax_wp.set_facecolor("#0a0a18")
+        ordered_arm = order_strokes(strokes_to_arm(spaced, (h, w, 3)))
+        total_pts   = sum(len(s) for s in ordered_arm)
+        cmap = plt.get_cmap("tab20")
+        for i, s in enumerate(ordered_arm):
+            ax_wp.plot(s[:, 0], s[:, 1], "o-", ms=1.5, lw=0.6, color=cmap(i % 20))
+        ax_wp.plot(0, 0, "o", color="#6060ff", ms=6)
+        ax_wp.set_xlim(-0.2, _MARGIN + _BOX + 0.3)
+        ax_wp.set_ylim(-0.2, _MARGIN + _BOX + 0.3)
+        ax_wp.set_aspect("equal"); ax_wp.axis("off")
+        ax_wp.set_title(f"Waypoints (arm space)  |  {total_pts} pts",
+                        color="white", fontsize=10, pad=4)
+
+        state["spaced"] = spaced
+        state["edges"]  = edges
+        state["step"]   = step
+        fig.canvas.draw_idle()
+
+    for sl in (sl_clahe, sl_bil, sl_canny, sl_gamma, sl_morph, sl_minlen, sl_spacing):
+        sl.on_changed(_reprocess)
+
+    btn_start.on_clicked(lambda _: plt.close(fig))
+
+    _reprocess()                   # initial render
+    plt.show(block=True)           # blocks until Start is clicked (closes fig)
+
+    return state["spaced"], state["edges"], img_bgr, state["step"]
+
 
 
 # ─── FK helper ────────────────────────────────────────────────────────────────
@@ -245,37 +411,6 @@ def fk_joints(angles):
     res = ARM.forward_kinematics(angles)
     pts = res["joint_positions"]   # shape (4, 2): base, j1, j2, EE
     return pts[0], pts[1], pts[2], pts[3]
-
-
-# ─── Preview (non-blocking, waits for ENTER) ─────────────────────────────────
-def show_preview(img_bgr, edges, ordered_strokes):
-    fig, axs = plt.subplots(1, 3, figsize=(16, 5))
-    fig.patch.set_facecolor("#0d0d1a")
-    fig.canvas.manager.set_window_title("Preview — press ENTER in terminal to start")
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    axs[0].imshow(img_rgb)
-    axs[0].set_title("Original Image", color="white", fontsize=11)
-    axs[1].imshow(edges, cmap="gray_r")
-    axs[1].set_title("Sketch",         color="white", fontsize=11)
-
-    # Waypoints panel — arm coordinates, upper-right quadrant
-    cmap = plt.get_cmap("tab20")
-    axs[2].set_facecolor("#0a0a18")
-    axs[2].set_title("Waypoints (arm space)", color="white", fontsize=11)
-    # Y is NOT inverted — arm coords already have y going upward
-    for i, s in enumerate(ordered_strokes):
-        axs[2].plot(s[:, 0], s[:, 1], "o-", ms=1.8, lw=0.7, color=cmap(i % 20))
-    axs[2].set_xlim(-0.2, _MARGIN + _BOX + 0.3)
-    axs[2].set_ylim(-0.2, _MARGIN + _BOX + 0.3)
-    axs[2].set_aspect("equal")
-    axs[2].plot(0, 0, "o", color="#6060ff", ms=7)   # arm base
-
-    for ax in axs[:2]: ax.axis("off")
-    axs[2].axis("off")
-    fig.tight_layout()
-    plt.show(block=False); plt.pause(0.3)
-    input("\n  ► Preview is open. Press ENTER to start the simulation… ")
-    plt.close(fig)
 
 
 # ─── Main animation ───────────────────────────────────────────────────────────
@@ -298,28 +433,32 @@ def run_animation(all_frames, ordered_strokes):
     ax_sp = fig.add_axes([0.15, 0.025, 0.55, 0.022])  # speed slider
     ax_sp.set_facecolor("#1e1e3a")
 
-    # Canvas — zoomed to upper-right quadrant where all drawing happens
-    ax_c.set_facecolor("#0a0a18")
+    # Canvas — white background, upper-right quadrant
+    # NOTE: axis("off") suppresses the facecolor in many matplotlib versions.
+    # Use manual spine/tick hiding instead — this reliably keeps the white background.
+    ax_c.set_facecolor("white")
     ax_c.set_xlim(-0.8, ARM.max_reach + 0.5)
     ax_c.set_ylim(-0.8, ARM.max_reach + 0.5)
     ax_c.set_aspect("equal")
-    ax_c.axis("off")
+    ax_c.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+    for spine in ax_c.spines.values():
+        spine.set_visible(False)
     ax_c.set_title("Drawing Simulation  (arm base ─●, canvas = upper-right quadrant)",
                    color="white", fontsize=11, pad=6)
 
-    # Draw axes (x and y from origin)
-    ax_c.axhline(0, color="#2a2a50", lw=0.8, zorder=0)
-    ax_c.axvline(0, color="#2a2a50", lw=0.8, zorder=0)
+    # Reference lines — light grey so visible on white canvas
+    ax_c.axhline(0, color="#aaaacc", lw=0.8, zorder=0)
+    ax_c.axvline(0, color="#aaaacc", lw=0.8, zorder=0)
 
-    # Workspace arc (upper-right quarter of the max-reach circle)
+    # Workspace arc (upper-right quarter)
     th_q = np.linspace(0, np.pi / 2, 180)
     ax_c.plot(ARM.max_reach * np.cos(th_q), ARM.max_reach * np.sin(th_q),
-              color="#2a2a50", lw=1.2, ls="--", zorder=0)
+              color="#aaaacc", lw=1.2, ls="--", zorder=0)
 
-    # Drawable box corners (faint rectangle showing the target area)
+    # Drawable box corners
     bx = [_MARGIN, _MARGIN+_BOX, _MARGIN+_BOX, _MARGIN, _MARGIN]
     by = [_MARGIN, _MARGIN,      _MARGIN+_BOX,  _MARGIN+_BOX, _MARGIN]
-    ax_c.plot(bx, by, color="#2a3060", lw=0.8, ls=":", zorder=0)
+    ax_c.plot(bx, by, color="#ccccdd", lw=0.8, ls=":", zorder=0)
 
     ax_c.plot(0, 0, "o", color="#6060ff", ms=7, zorder=1, label="arm base")
 
@@ -343,9 +482,9 @@ def run_animation(all_frames, ordered_strokes):
         ax_c.plot([], [], color="#3affaf", lw=3,   solid_capstyle="round", zorder=5)[0],
         ax_c.plot([], [], color="#ff8c3a", lw=2.5, solid_capstyle="round", zorder=5)[0],
     ]
-    joint_dots = [ax_c.plot([], [], "o", color="white", ms=5, zorder=6)[0] for _ in range(4)]
-    ee_dot     =  ax_c.plot([], [], "o", color="#ffff00", ms=6, zorder=7)[0]
-    stroke_lines = [ax_c.plot([], [], color="#ff6680", lw=1.2, alpha=0.9, zorder=3)[0]
+    joint_dots = [ax_c.plot([], [], "o", color="#222222", ms=5, zorder=6)[0] for _ in range(4)]
+    ee_dot     =  ax_c.plot([], [], "o", color="#cc0000", ms=6, zorder=7)[0]
+    stroke_lines = [ax_c.plot([], [], color="#111111", lw=1.0, alpha=1.0, zorder=3)[0]
                     for _ in ordered_strokes]
     lift_line    =  ax_c.plot([], [], "--", color="#333366", lw=0.8, zorder=2)[0]
     vel_lines    = [ax.plot([], [], color=c, lw=1.0)[0]
@@ -438,9 +577,9 @@ def run_animation(all_frames, ordered_strokes):
 
 # ─── Main entry ───────────────────────────────────────────────────────────────
 def main():
-    print("╔══════════════════════════════════════════════════════╗")
+    print("╔" + "═"*54 + "╗")
     print("║  Week 5 — Full Robot Drawing Pipeline                ║")
-    print("╚══════════════════════════════════════════════════════╝\n")
+    print("╚" + "═"*54 + "╝\n")
 
     root = tk.Tk(); root.withdraw()
     img_path = filedialog.askopenfilename(
@@ -450,10 +589,14 @@ def main():
     if not img_path:
         print("No image selected. Exiting."); return
 
-    print(f"[1/5] Processing image: {os.path.basename(img_path)}")
-    strokes_px, edges, img_bgr, step_px = process_image(img_path)
-    print(f"      {len(strokes_px)} strokes  {sum(len(s) for s in strokes_px)} waypoints")
+    # [1] Interactive tuner — user adjusts sliders, clicks Start
+    print(f"[1/5] Opening interactive tuner for: {os.path.basename(img_path)}")
+    print("      Adjust sliders until happy, then click ▶ Start Simulation")
+    strokes_px, edges, img_bgr, step_px = interactive_preview(img_path)
+    print(f"      Tuning done: {len(strokes_px)} strokes  "
+          f"{sum(len(s) for s in strokes_px)} waypoints  step={step_px:.1f}px")
 
+    # [2] Transform pixel strokes → arm workspace
     print("[2/5] Transforming to arm workspace …")
     strokes_arm = strokes_to_arm(strokes_px, img_bgr.shape)
 
@@ -472,8 +615,6 @@ def main():
     dur = len(all_frames) / (1000/20)
     print(f"      {len(all_frames)} frames  ≈  {dur:.1f} s\n")
 
-    # ── Preview first, then animation in a fresh event loop ──────────────────
-    show_preview(img_bgr, edges, ordered)
     run_animation(all_frames, ordered)
 
 
